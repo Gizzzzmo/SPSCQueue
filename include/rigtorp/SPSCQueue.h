@@ -29,6 +29,7 @@ SOFTWARE.
 #include <new>    // std::hardware_destructive_interference_size
 #include <stdexcept>
 #include <type_traits> // std::enable_if, std::is_*_constructible
+// #include <iostream>
 
 #ifdef __has_cpp_attribute
 #if __has_cpp_attribute(nodiscard)
@@ -106,6 +107,8 @@ public:
       std::is_nothrow_constructible<T, Args &&...>::value) {
     static_assert(std::is_constructible<T, Args &&...>::value,
                   "T must be constructible with Args&&...");
+    if (buildReserved > 0)
+      return;
     auto const writeIdx = writeIdx_.load(std::memory_order_relaxed);
     auto nextWriteIdx = writeIdx + 1;
     if (nextWriteIdx == capacity_) {
@@ -116,6 +119,56 @@ public:
     }
     new (&slots_[writeIdx + kPadding]) T(std::forward<Args>(args)...);
     writeIdx_.store(nextWriteIdx, std::memory_order_release);
+  }
+
+  bool wait_reserve_build(size_t n) {
+    if ((n + buildReserved) > capacity_ - 1)
+      return false;
+
+    buildReserved += n;
+
+    size_t writable_space;
+    do {
+      readIdxCache_ = readIdx_.load(std::memory_order_acquire);
+      writable_space = (readIdxCache_ > buildIdx ? readIdxCache_ : (readIdxCache_ + capacity_)) - buildIdx - 1;
+    } while(writable_space < buildReserved);
+
+    return true;
+  }
+
+  template<typename... Args>
+  T* build(Args&&... args)  noexcept(
+      std::is_nothrow_constructible<T, Args &&...>::value) {
+    static_assert(std::is_constructible<T, Args &&...>::value,
+                  "T must be constructible with Args&&...");
+    if (buildReserved == 0)
+      return nullptr;
+
+    auto nextBuildIdx = buildIdx + 1;
+    if (nextBuildIdx == capacity_) {
+      nextBuildIdx = 0;
+    }
+    T* built = new (&slots_[buildIdx + kPadding]) T(std::forward<Args>(args)...);
+    buildIdx = nextBuildIdx;
+    buildReserved--;
+    return built;
+  }
+
+  size_t finish_build(size_t n) noexcept {
+    auto const writeIdx = writeIdx_.load(std::memory_order_relaxed);
+    auto max_n = (buildIdx >= writeIdx ? buildIdx : (buildIdx + capacity_)) - writeIdx;
+
+    n = std::min(n, max_n);
+
+    if (n == 0)
+      return 0;
+    
+    auto nextWriteIdx = writeIdx + n;
+    if (nextWriteIdx >= capacity_) {
+      nextWriteIdx -= capacity_;
+    }
+    writeIdx_.store(nextWriteIdx, std::memory_order_release);
+    return n;
   }
 
   template <typename... Args>
@@ -176,6 +229,24 @@ public:
     return &slots_[readIdx + kPadding];
   }
 
+  //size_t wait_reserve_read(size_t n) {
+  //  if (n + readReserved > capacity_)
+  //    return 0;
+//
+  //  auto nextBufferedReadIdx = bufferedReadIdx + n;
+  //  if (nextBufferedReadIdx > capacity_)
+  //    nextBufferedReadIdx -= capacity_;
+//
+  //  size_t readable_space;
+  //  do {
+  //    writeIdxCache_ = writeIdx_.load(std::memory_order_relaxed);
+  //    readable_space = writeIdxCache_ > nextBufferedReadIdx ? writeIdxCache_ : (writeIdxCache_ + capacity_);
+  //    readable_space -= readIdxCache_;
+  //  } while(readable_space < n);
+//
+  //  return true;
+  //}
+
   void pop() noexcept {
     static_assert(std::is_nothrow_destructible<T>::value,
                   "T must be nothrow destructible");
@@ -233,5 +304,10 @@ private:
   alignas(kCacheLineSize) size_t readIdxCache_ = 0;
   alignas(kCacheLineSize) std::atomic<size_t> readIdx_ = {0};
   alignas(kCacheLineSize) size_t writeIdxCache_ = 0;
+  alignas(kCacheLineSize) size_t buildReserved = 0;
+  alignas(kCacheLineSize) size_t buildIdx = 0;
+  alignas(kCacheLineSize) size_t readReserved;
+  alignas(kCacheLineSize) size_t bufferedReadIdx = 0;
+  alignas(kCacheLineSize) std::atomic<bool> flush = {false};
 };
 } // namespace rigtorp
